@@ -1,0 +1,1844 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+const fs_1 = require("fs");
+const path_1 = require("path");
+const axios_1 = __importDefault(require("axios"));
+const commander_1 = require("commander");
+const progress_1 = __importDefault(require("progress"));
+const fluent_ffmpeg_1 = __importDefault(require("fluent-ffmpeg"));
+const rimraf_1 = __importDefault(require("rimraf"));
+commander_1.program.requiredOption('-b, --bv <string>', 'BV id');
+commander_1.program.requiredOption('-c, --cookie <number>', 'SESSDATA');
+commander_1.program.requiredOption('-d, --directory <string>', 'Output directory', './output');
+commander_1.program.parse(process.argv);
+const userAgent = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.122 Safari/537.36`;
+let directory = './output';
+let BVID;
+let SESSDATA;
+let videoData;
+const values = commander_1.program.opts();
+if (values.bv) {
+    BVID = values.bv;
+}
+if (values.cookie) {
+    SESSDATA = decodeURI(values.cookie);
+}
+if (values.directory) {
+    directory = (0, path_1.join)(values.directory);
+}
+console.log('Input config:');
+console.table({
+    BV: BVID,
+    SESSDATA: SESSDATA,
+    Directory: directory ? (0, path_1.resolve)(directory) : ''
+});
+async function getCurrentUserData() {
+    const result = await axios_1.default.get('https://api.bilibili.com/nav', {
+        headers: {
+            Cookie: `SESSDATA=${SESSDATA || ''}`,
+            'User-Agent': userAgent
+        }
+    });
+    if (result.data.code === 0) {
+        console.log('Current user:');
+        console.table({
+            id: result.data.data.mid,
+            name: result.data.data.uname,
+            isVip: result.data.data.vipStatus === 1
+        });
+    }
+    else {
+        throw new Error(`Error getting user information`);
+    }
+}
+async function getVideoData() {
+    const result = await axios_1.default.get('https://api.bilibili.com/x/web-interface/view', {
+        params: {
+            bvid: BVID
+        },
+        headers: {
+            Cookie: `SESSDATA=${SESSDATA || ''}`,
+            'User-Agent': userAgent
+        }
+    });
+    if (result.data.code === 0) {
+        let info = {
+            BV: result.data.data.bvid,
+            AV: `AV${result.data.data.aid}`,
+            Title: result.data.data.title,
+            // desc: result.data.data.desc
+        };
+        for (const [index, item] of result.data.data.pages.entries()) {
+            info[`Part-${index + 1}`] = item.part;
+        }
+        console.log('Video data:');
+        console.table(info);
+        return result.data.data;
+    }
+    else {
+        throw new Error(`Error getting video data`);
+    }
+}
+class BaseStream {
+    constructor(from, result, message, quality, format, timelength, accept_format, accept_description, accept_quality, video_codecid, seek_param, seek_type) {
+        this.from = from;
+        this.result = result;
+        this.message = message;
+        this.quality = quality;
+        this.format = format;
+        this.timelength = timelength;
+        this.accept_format = accept_format;
+        this.accept_description = accept_description;
+        this.accept_quality = accept_quality;
+        this.video_codecid = video_codecid;
+        this.seek_param = seek_param;
+        this.seek_type = seek_type;
+    }
+}
+class DashStream {
+    constructor(from, result, message, quality, format, timelength, accept_format, accept_description, accept_quality, video_codecid, seek_param, seek_type, dash) {
+        this.from = from;
+        this.result = result;
+        this.message = message;
+        this.quality = quality;
+        this.format = format;
+        this.timelength = timelength;
+        this.accept_format = accept_format;
+        this.accept_description = accept_description;
+        this.accept_quality = accept_quality;
+        this.video_codecid = video_codecid;
+        this.seek_param = seek_param;
+        this.seek_type = seek_type;
+        this.dash = dash;
+    }
+    get stream() {
+        return {
+            video: this.dash.video.sort((a, b) => b.id - a.id)[0],
+            audio: this.dash.audio.sort((a, b) => b.id - a.id)[0]
+        };
+    }
+}
+class FlvStream {
+    constructor(from, result, message, quality, format, timelength, accept_format, accept_description, accept_quality, video_codecid, seek_param, seek_type, durl) {
+        this.from = from;
+        this.result = result;
+        this.message = message;
+        this.quality = quality;
+        this.format = format;
+        this.timelength = timelength;
+        this.accept_format = accept_format;
+        this.accept_description = accept_description;
+        this.accept_quality = accept_quality;
+        this.video_codecid = video_codecid;
+        this.seek_param = seek_param;
+        this.seek_type = seek_type;
+        this.durl = durl;
+    }
+}
+async function getAcceptQuality(cid) {
+    const result = await axios_1.default.get('https://api.bilibili.com/x/player/playurl', {
+        params: {
+            bvid: BVID,
+            cid,
+            fourk: 1,
+            fnval: 80
+        },
+        headers: {
+            Cookie: `SESSDATA=${SESSDATA || ''}`,
+            'User-Agent': userAgent
+        }
+    });
+    if (result.data.code === 0) {
+        return result.data.data.accept_quality.sort((a, b) => b - a);
+    }
+    else {
+        throw new Error(`Failed to obtain video information`);
+    }
+}
+async function getVideoUrl(cid, qualityId) {
+    const result = await axios_1.default.get('https://api.bilibili.com/x/player/playurl', {
+        params: {
+            bvid: BVID,
+            cid,
+            fnval: 80,
+            qn: qualityId,
+            fourk: 1
+        },
+        headers: {
+            Cookie: `SESSDATA=${SESSDATA || ''}`,
+            'User-Agent': userAgent
+        }
+    });
+    if (result.data.code === 0) {
+        const _data = result.data.data;
+        const acceptFormat = _data.accept_format.split(',');
+        if ((acceptFormat.includes('mp4') || acceptFormat.includes('hdflv2')) || Object.keys(_data).includes('dash')) {
+            return new DashStream(_data.from, _data.result, _data.message, _data.quality, _data.format, _data.timelength, _data.accept_format, _data.accept_description, _data.accept_quality, _data.video_codecid, _data.seek_param, _data.seek_type, _data.dash);
+        }
+        else {
+            return new FlvStream(_data.from, _data.result, _data.message, _data.quality, _data.format, _data.timelength, _data.accept_format, _data.accept_description, _data.accept_quality, _data.video_codecid, _data.seek_param, _data.seek_type, _data.durl);
+        }
+    }
+    else {
+        throw new Error(`Error getting video download link`);
+    }
+}
+async function download(part, url, type) {
+    const response = await axios_1.default.get(url, {
+        responseType: 'stream',
+        headers: {
+            'User-Agent': userAgent,
+            'Referer': `https://www.bilibili.com/video/${BVID}`
+        }
+    });
+    let downloaded = 0;
+    const contentType = type || String(response.headers['content-type']);
+    const total = Number(response.headers['content-length']);
+    const filePath = (0, path_1.join)(__dirname, '/tmp', `${part.cid}-${total}`);
+    const bar = new progress_1.default(`${contentType} [:bar] :percent :downloaded/:length`, {
+        width: 30,
+        total: total
+    });
+    response.data.pipe((0, fs_1.createWriteStream)(filePath));
+    return new Promise((resolve, reject) => {
+        response.data.on('data', (chunk) => {
+            downloaded += chunk.length;
+            bar.tick(chunk.length, {
+                downloaded: transform(downloaded),
+                length: transform(total)
+            });
+        });
+        response.data.on('end', () => resolve(filePath));
+        response.data.on('error', (err) => reject(err));
+    });
+}
+function convert(fileName, part, paths) {
+    return new Promise((resolve, reject) => {
+        if (paths.length <= 0) {
+            return;
+        }
+        (0, fs_1.mkdirSync)((0, path_1.join)(directory), { recursive: true });
+        const command = (0, fluent_ffmpeg_1.default)();
+        for (const item of paths) {
+            command.mergeAdd(item);
+        }
+        command.videoCodec(`copy`);
+        command.audioCodec(`copy`);
+        command.output((0, path_1.join)(directory, `${fileName}_${BVID}_${part.part}.mkv`));
+        command.on('start', () => {
+            console.log(`Convert start`);
+        });
+        command.on('error', err => {
+            for (const item of paths) {
+                rimraf_1.default.sync(item);
+            }
+            reject(err);
+        });
+        command.on('end', () => {
+            for (const item of paths) {
+                rimraf_1.default.sync(item);
+            }
+            console.log(`Convert complete`);
+            resolve();
+        });
+        command.run();
+    });
+}
+function transform(value) {
+    if (!value || value <= 0) {
+        return '0 bytes';
+    }
+    const s = ['bytes', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    const e = Math.floor(Math.log(value) / Math.log(1024));
+    return `${(value / Math.pow(1024, Math.floor(e))).toFixed(2)}${s[e]}`;
+}
+function normalizeName(str) {
+    str = str.replace(/(\?|\*)/g, '');
+    str = str.replace(/(\/|\|)/g, ' ');
+    str = str.replace(/:/g, '-');
+    str = str.replace(/"/g, '\`');
+    str = str.replace(/</g, '(');
+    str = str.replace(/>/g, ')');
+    return str;
+}
+async function main() {
+    if (!BVID) {
+        return;
+    }
+    (0, fs_1.mkdirSync)((0, path_1.join)(__dirname, '/tmp'), { recursive: true });
+    await getCurrentUserData();
+    videoData = await getVideoData();
+    for (const item of videoData.pages) {
+        const qualityArray = await getAcceptQuality(item.cid);
+        const stream = await getVideoUrl(item.cid, qualityArray[0]);
+        const paths = [];
+        console.log(`Part: ${item.page}`);
+        console.log(`Name: ${item.part}`);
+        if (stream instanceof DashStream) {
+            const videoPath = await download(item, stream.stream.video.baseUrl, stream.dash.video[0].mimeType);
+            const audioPath = await download(item, stream.stream.audio.baseUrl, stream.dash.audio[0].mimeType);
+            paths.push(videoPath);
+            paths.push(audioPath);
+        }
+        if (stream instanceof FlvStream) {
+            const filePath = await download(item, stream.durl[0].url);
+            paths.push(filePath);
+        }
+        await convert(normalizeName(videoData.title), item, paths);
+    }
+    rimraf_1.default.sync((0, path_1.join)(__dirname, '/tmp'));
+    console.log(`Task complete`);
+}
+main();
+//# sourceMappingURL=bilibili.js.map
+
+{
+"name": "bilibilivideodownload",
+"version": "1.0.0",
+"lockfileVersion": 2,
+"requires": true,
+"packages": {
+"": {
+"name": "bilibilivideodownload",
+"version": "1.0.0",
+"license": "ISC",
+"dependencies": {
+"axios": "^0.24.0",
+"commander": "^8.3.0",
+"fluent-ffmpeg": "^2.1.2",
+"progress": "^2.0.3",
+"rimraf": "^3.0.2"
+},
+"devDependencies": {
+"@types/fluent-ffmpeg": "^2.1.18",
+"@types/node": "^16.11.6",
+"@types/progress": "^2.0.5",
+"@types/rimraf": "^3.0.2",
+"typescript": "^4.4.4"
+}
+},
+"node_modules/@types/events": {
+"version": "3.0.0",
+"resolved": "https://registry.npm.taobao.org/@types/events/download/@types/events-3.0.0.tgz?cache=0&sync_timestamp=1588200013267&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fevents%2Fdownload%2F%40types%2Fevents-3.0.0.tgz",
+"integrity": "sha1-KGLz9Yqaf3w+eNefEw3U1xwlwqc=",
+"dev": true
+},
+"node_modules/@types/fluent-ffmpeg": {
+"version": "2.1.18",
+"resolved": "https://registry.npmjs.org/@types/fluent-ffmpeg/-/fluent-ffmpeg-2.1.18.tgz",
+"integrity": "sha512-LTteOx3RUmnPlKkvhvW9aGOHdJYyEtIiRBVbYVO/zPU65ZYQelbPJ+zBBT+IXup7doMvxVstX7NMoUTWKZOhww==",
+"dev": true,
+"dependencies": {
+"@types/node": "*"
+}
+},
+"node_modules/@types/glob": {
+"version": "7.1.1",
+"resolved": "https://registry.npm.taobao.org/@types/glob/download/@types/glob-7.1.1.tgz?cache=0&sync_timestamp=1588200288112&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fglob%2Fdownload%2F%40types%2Fglob-7.1.1.tgz",
+"integrity": "sha1-qlmhxuP7xCHgfM0xqUTDDrpSFXU=",
+"dev": true,
+"dependencies": {
+"@types/events": "*",
+"@types/minimatch": "*",
+"@types/node": "*"
+}
+},
+"node_modules/@types/minimatch": {
+"version": "3.0.3",
+"resolved": "https://registry.npm.taobao.org/@types/minimatch/download/@types/minimatch-3.0.3.tgz",
+"integrity": "sha1-PcoOPzOyAPx9ETnAzZbBJoyt/Z0=",
+"dev": true
+},
+"node_modules/@types/node": {
+"version": "16.11.6",
+"resolved": "https://registry.npmjs.org/@types/node/-/node-16.11.6.tgz",
+"integrity": "sha512-ua7PgUoeQFjmWPcoo9khiPum3Pd60k4/2ZGXt18sm2Slk0W0xZTqt5Y0Ny1NyBiN1EVQ/+FaF9NcY4Qe6rwk5w==",
+"dev": true
+},
+"node_modules/@types/progress": {
+"version": "2.0.5",
+"resolved": "https://registry.npmjs.org/@types/progress/-/progress-2.0.5.tgz",
+"integrity": "sha512-ZYYVc/kSMkhH9W/4dNK/sLNra3cnkfT2nJyOAIDY+C2u6w72wa0s1aXAezVtbTsnN8HID1uhXCrLwDE2ZXpplg==",
+"dev": true,
+"dependencies": {
+"@types/node": "*"
+}
+},
+"node_modules/@types/rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npmjs.org/@types/rimraf/-/rimraf-3.0.2.tgz",
+"integrity": "sha512-F3OznnSLAUxFrCEu/L5PY8+ny8DtcFRjx7fZZ9bycvXRi3KPTRS9HOitGZwvPg0juRhXFWIeKX58cnX5YqLohQ==",
+"dev": true,
+"dependencies": {
+"@types/glob": "*",
+"@types/node": "*"
+}
+},
+"node_modules/async": {
+"version": "3.2.0",
+"resolved": "https://registry.npm.taobao.org/async/download/async-3.2.0.tgz",
+"integrity": "sha1-s6JoXF67ZB094C0WEALGD8n4VyA="
+},
+"node_modules/axios": {
+"version": "0.24.0",
+"resolved": "https://registry.npmjs.org/axios/-/axios-0.24.0.tgz",
+"integrity": "sha512-Q6cWsys88HoPgAaFAVUb0WpPk0O8iTeisR9IMqy9G8AbO4NlpVknrnQS03zzF9PGAWgO3cgletO3VjV/P7VztA==",
+"dependencies": {
+"follow-redirects": "^1.14.4"
+}
+},
+"node_modules/balanced-match": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/balanced-match/download/balanced-match-1.0.0.tgz",
+"integrity": "sha1-ibTRmasr7kneFk6gK4nORi1xt2c="
+},
+"node_modules/brace-expansion": {
+"version": "1.1.11",
+"resolved": "https://registry.npm.taobao.org/brace-expansion/download/brace-expansion-1.1.11.tgz",
+"integrity": "sha1-PH/L9SnYcibz0vUrlm/1Jx60Qd0=",
+"dependencies": {
+"balanced-match": "^1.0.0",
+"concat-map": "0.0.1"
+}
+},
+"node_modules/commander": {
+"version": "8.3.0",
+"resolved": "https://registry.npmjs.org/commander/-/commander-8.3.0.tgz",
+"integrity": "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww==",
+"engines": {
+"node": ">= 12"
+}
+},
+"node_modules/concat-map": {
+"version": "0.0.1",
+"resolved": "https://registry.npm.taobao.org/concat-map/download/concat-map-0.0.1.tgz",
+"integrity": "sha1-2Klr13/Wjfd5OnMDajug1UBdR3s="
+},
+"node_modules/fluent-ffmpeg": {
+"version": "2.1.2",
+"resolved": "https://registry.npm.taobao.org/fluent-ffmpeg/download/fluent-ffmpeg-2.1.2.tgz",
+"integrity": "sha1-yVLeIkD4EuvaCqgAbXd27irPfXQ=",
+"dependencies": {
+"async": ">=0.2.9",
+"which": "^1.1.1"
+},
+"engines": {
+"node": ">=0.8.0"
+}
+},
+"node_modules/follow-redirects": {
+"version": "1.14.4",
+"resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.14.4.tgz",
+"integrity": "sha512-zwGkiSXC1MUJG/qmeIFH2HBJx9u0V46QGUe3YR1fXG8bXQxq7fLj0RjLZQ5nubr9qNJUZrH+xUcwXEoXNpfS+g==",
+"funding": [
+{
+"type": "individual",
+"url": "https://github.com/sponsors/RubenVerborgh"
+}
+],
+"engines": {
+"node": ">=4.0"
+},
+"peerDependenciesMeta": {
+"debug": {
+"optional": true
+}
+}
+},
+"node_modules/fs.realpath": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/fs.realpath/download/fs.realpath-1.0.0.tgz",
+"integrity": "sha1-FQStJSMVjKpA20onh8sBQRmU6k8="
+},
+"node_modules/glob": {
+"version": "7.1.6",
+"resolved": "https://registry.npm.taobao.org/glob/download/glob-7.1.6.tgz?cache=0&sync_timestamp=1573078121947&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fglob%2Fdownload%2Fglob-7.1.6.tgz",
+"integrity": "sha1-FB8zuBp8JJLhJVlDB0gMRmeSeKY=",
+"dependencies": {
+"fs.realpath": "^1.0.0",
+"inflight": "^1.0.4",
+"inherits": "2",
+"minimatch": "^3.0.4",
+"once": "^1.3.0",
+"path-is-absolute": "^1.0.0"
+},
+"engines": {
+"node": "*"
+},
+"funding": {
+"url": "https://github.com/sponsors/isaacs"
+}
+},
+"node_modules/inflight": {
+"version": "1.0.6",
+"resolved": "https://registry.npm.taobao.org/inflight/download/inflight-1.0.6.tgz",
+"integrity": "sha1-Sb1jMdfQLQwJvJEKEHW6gWW1bfk=",
+"dependencies": {
+"once": "^1.3.0",
+"wrappy": "1"
+}
+},
+"node_modules/inherits": {
+"version": "2.0.4",
+"resolved": "https://registry.npm.taobao.org/inherits/download/inherits-2.0.4.tgz",
+"integrity": "sha1-D6LGT5MpF8NDOg3tVTY6rjdBa3w="
+},
+"node_modules/isexe": {
+"version": "2.0.0",
+"resolved": "https://registry.npm.taobao.org/isexe/download/isexe-2.0.0.tgz",
+"integrity": "sha1-6PvzdNxVb/iUehDcsFctYz8s+hA="
+},
+"node_modules/minimatch": {
+"version": "3.0.4",
+"resolved": "https://registry.npm.taobao.org/minimatch/download/minimatch-3.0.4.tgz",
+"integrity": "sha1-UWbihkV/AzBgZL5Ul+jbsMPTIIM=",
+"dependencies": {
+"brace-expansion": "^1.1.7"
+},
+"engines": {
+"node": "*"
+}
+},
+"node_modules/once": {
+"version": "1.4.0",
+"resolved": "https://registry.npm.taobao.org/once/download/once-1.4.0.tgz",
+"integrity": "sha1-WDsap3WWHUsROsF9nFC6753Xa9E=",
+"dependencies": {
+"wrappy": "1"
+}
+},
+"node_modules/path-is-absolute": {
+"version": "1.0.1",
+"resolved": "https://registry.npm.taobao.org/path-is-absolute/download/path-is-absolute-1.0.1.tgz",
+"integrity": "sha1-F0uSaHNVNP+8es5r9TpanhtcX18=",
+"engines": {
+"node": ">=0.10.0"
+}
+},
+"node_modules/progress": {
+"version": "2.0.3",
+"resolved": "http://registry.npm.taobao.org/progress/download/progress-2.0.3.tgz",
+"integrity": "sha1-foz42PW48jnBvGi+tOt4Vn1XLvg=",
+"engines": {
+"node": ">=0.4.0"
+}
+},
+"node_modules/rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npm.taobao.org/rimraf/download/rimraf-3.0.2.tgz",
+"integrity": "sha1-8aVAK6YiCtUswSgrrBrjqkn9Bho=",
+"dependencies": {
+"glob": "^7.1.3"
+},
+"bin": {
+"rimraf": "bin.js"
+},
+"funding": {
+"url": "https://github.com/sponsors/isaacs"
+}
+},
+"node_modules/typescript": {
+"version": "4.4.4",
+"resolved": "https://registry.npmjs.org/typescript/-/typescript-4.4.4.tgz",
+"integrity": "sha512-DqGhF5IKoBl8WNf8C1gu8q0xZSInh9j1kJJMqT3a94w1JzVaBU4EXOSMrz9yDqMT0xt3selp83fuFMQ0uzv6qA==",
+"dev": true,
+"bin": {
+"tsc": "bin/tsc",
+"tsserver": "bin/tsserver"
+},
+"engines": {
+"node": ">=4.2.0"
+}
+},
+"node_modules/which": {
+"version": "1.3.1",
+"resolved": "https://registry.npm.taobao.org/which/download/which-1.3.1.tgz?cache=0&sync_timestamp=1574116720213&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fwhich%2Fdownload%2Fwhich-1.3.1.tgz",
+"integrity": "sha1-pFBD1U9YBTFtqNYvn1CRjT2nCwo=",
+"dependencies": {
+"isexe": "^2.0.0"
+},
+"bin": {
+"which": "bin/which"
+}
+},
+"node_modules/wrappy": {
+"version": "1.0.2",
+"resolved": "https://registry.npm.taobao.org/wrappy/download/wrappy-1.0.2.tgz",
+"integrity": "sha1-tSQ9jz7BqjXxNkYFvA0QNuMKtp8="
+}
+},
+"dependencies": {
+"@types/events": {
+"version": "3.0.0",
+"resolved": "https://registry.npm.taobao.org/@types/events/download/@types/events-3.0.0.tgz?cache=0&sync_timestamp=1588200013267&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fevents%2Fdownload%2F%40types%2Fevents-3.0.0.tgz",
+"integrity": "sha1-KGLz9Yqaf3w+eNefEw3U1xwlwqc=",
+"dev": true
+},
+"@types/fluent-ffmpeg": {
+"version": "2.1.18",
+"resolved": "https://registry.npmjs.org/@types/fluent-ffmpeg/-/fluent-ffmpeg-2.1.18.tgz",
+"integrity": "sha512-LTteOx3RUmnPlKkvhvW9aGOHdJYyEtIiRBVbYVO/zPU65ZYQelbPJ+zBBT+IXup7doMvxVstX7NMoUTWKZOhww==",
+"dev": true,
+"requires": {
+"@types/node": "*"
+}
+},
+"@types/glob": {
+"version": "7.1.1",
+"resolved": "https://registry.npm.taobao.org/@types/glob/download/@types/glob-7.1.1.tgz?cache=0&sync_timestamp=1588200288112&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fglob%2Fdownload%2F%40types%2Fglob-7.1.1.tgz",
+"integrity": "sha1-qlmhxuP7xCHgfM0xqUTDDrpSFXU=",
+"dev": true,
+"requires": {
+"@types/events": "*",
+"@types/minimatch": "*",
+"@types/node": "*"
+}
+},
+"@types/minimatch": {
+"version": "3.0.3",
+"resolved": "https://registry.npm.taobao.org/@types/minimatch/download/@types/minimatch-3.0.3.tgz",
+"integrity": "sha1-PcoOPzOyAPx9ETnAzZbBJoyt/Z0=",
+"dev": true
+},
+"@types/node": {
+"version": "16.11.6",
+"resolved": "https://registry.npmjs.org/@types/node/-/node-16.11.6.tgz",
+"integrity": "sha512-ua7PgUoeQFjmWPcoo9khiPum3Pd60k4/2ZGXt18sm2Slk0W0xZTqt5Y0Ny1NyBiN1EVQ/+FaF9NcY4Qe6rwk5w==",
+"dev": true
+},
+"@types/progress": {
+"version": "2.0.5",
+"resolved": "https://registry.npmjs.org/@types/progress/-/progress-2.0.5.tgz",
+"integrity": "sha512-ZYYVc/kSMkhH9W/4dNK/sLNra3cnkfT2nJyOAIDY+C2u6w72wa0s1aXAezVtbTsnN8HID1uhXCrLwDE2ZXpplg==",
+"dev": true,
+"requires": {
+"@types/node": "*"
+}
+},
+"@types/rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npmjs.org/@types/rimraf/-/rimraf-3.0.2.tgz",
+"integrity": "sha512-F3OznnSLAUxFrCEu/L5PY8+ny8DtcFRjx7fZZ9bycvXRi3KPTRS9HOitGZwvPg0juRhXFWIeKX58cnX5YqLohQ==",
+"dev": true,
+"requires": {
+"@types/glob": "*",
+"@types/node": "*"
+}
+},
+"async": {
+"version": "3.2.0",
+"resolved": "https://registry.npm.taobao.org/async/download/async-3.2.0.tgz",
+"integrity": "sha1-s6JoXF67ZB094C0WEALGD8n4VyA="
+},
+"axios": {
+"version": "0.24.0",
+"resolved": "https://registry.npmjs.org/axios/-/axios-0.24.0.tgz",
+"integrity": "sha512-Q6cWsys88HoPgAaFAVUb0WpPk0O8iTeisR9IMqy9G8AbO4NlpVknrnQS03zzF9PGAWgO3cgletO3VjV/P7VztA==",
+"requires": {
+"follow-redirects": "^1.14.4"
+}
+},
+"balanced-match": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/balanced-match/download/balanced-match-1.0.0.tgz",
+"integrity": "sha1-ibTRmasr7kneFk6gK4nORi1xt2c="
+},
+"brace-expansion": {
+"version": "1.1.11",
+"resolved": "https://registry.npm.taobao.org/brace-expansion/download/brace-expansion-1.1.11.tgz",
+"integrity": "sha1-PH/L9SnYcibz0vUrlm/1Jx60Qd0=",
+"requires": {
+"balanced-match": "^1.0.0",
+"concat-map": "0.0.1"
+}
+},
+"commander": {
+"version": "8.3.0",
+"resolved": "https://registry.npmjs.org/commander/-/commander-8.3.0.tgz",
+"integrity": "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww=="
+},
+"concat-map": {
+"version": "0.0.1",
+"resolved": "https://registry.npm.taobao.org/concat-map/download/concat-map-0.0.1.tgz",
+"integrity": "sha1-2Klr13/Wjfd5OnMDajug1UBdR3s="
+},
+"fluent-ffmpeg": {
+"version": "2.1.2",
+"resolved": "https://registry.npm.taobao.org/fluent-ffmpeg/download/fluent-ffmpeg-2.1.2.tgz",
+"integrity": "sha1-yVLeIkD4EuvaCqgAbXd27irPfXQ=",
+"requires": {
+"async": ">=0.2.9",
+"which": "^1.1.1"
+}
+},
+"follow-redirects": {
+"version": "1.14.4",
+"resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.14.4.tgz",
+"integrity": "sha512-zwGkiSXC1MUJG/qmeIFH2HBJx9u0V46QGUe3YR1fXG8bXQxq7fLj0RjLZQ5nubr9qNJUZrH+xUcwXEoXNpfS+g=="
+},
+"fs.realpath": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/fs.realpath/download/fs.realpath-1.0.0.tgz",
+"integrity": "sha1-FQStJSMVjKpA20onh8sBQRmU6k8="
+},
+"glob": {
+"version": "7.1.6",
+"resolved": "https://registry.npm.taobao.org/glob/download/glob-7.1.6.tgz?cache=0&sync_timestamp=1573078121947&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fglob%2Fdownload%2Fglob-7.1.6.tgz",
+"integrity": "sha1-FB8zuBp8JJLhJVlDB0gMRmeSeKY=",
+"requires": {
+"fs.realpath": "^1.0.0",
+"inflight": "^1.0.4",
+"inherits": "2",
+"minimatch": "^3.0.4",
+"once": "^1.3.0",
+"path-is-absolute": "^1.0.0"
+}
+},
+"inflight": {
+"version": "1.0.6",
+"resolved": "https://registry.npm.taobao.org/inflight/download/inflight-1.0.6.tgz",
+"integrity": "sha1-Sb1jMdfQLQwJvJEKEHW6gWW1bfk=",
+"requires": {
+"once": "^1.3.0",
+"wrappy": "1"
+}
+},
+"inherits": {
+"version": "2.0.4",
+"resolved": "https://registry.npm.taobao.org/inherits/download/inherits-2.0.4.tgz",
+"integrity": "sha1-D6LGT5MpF8NDOg3tVTY6rjdBa3w="
+},
+"isexe": {
+"version": "2.0.0",
+"resolved": "https://registry.npm.taobao.org/isexe/download/isexe-2.0.0.tgz",
+"integrity": "sha1-6PvzdNxVb/iUehDcsFctYz8s+hA="
+},
+"minimatch": {
+"version": "3.0.4",
+"resolved": "https://registry.npm.taobao.org/minimatch/download/minimatch-3.0.4.tgz",
+"integrity": "sha1-UWbihkV/AzBgZL5Ul+jbsMPTIIM=",
+"requires": {
+"brace-expansion": "^1.1.7"
+}
+},
+"once": {
+"version": "1.4.0",
+"resolved": "https://registry.npm.taobao.org/once/download/once-1.4.0.tgz",
+"integrity": "sha1-WDsap3WWHUsROsF9nFC6753Xa9E=",
+"requires": {
+"wrappy": "1"
+}
+},
+"path-is-absolute": {
+"version": "1.0.1",
+"resolved": "https://registry.npm.taobao.org/path-is-absolute/download/path-is-absolute-1.0.1.tgz",
+"integrity": "sha1-F0uSaHNVNP+8es5r9TpanhtcX18="
+},
+"progress": {
+"version": "2.0.3",
+"resolved": "http://registry.npm.taobao.org/progress/download/progress-2.0.3.tgz",
+"integrity": "sha1-foz42PW48jnBvGi+tOt4Vn1XLvg="
+},
+"rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npm.taobao.org/rimraf/download/rimraf-3.0.2.tgz",
+"integrity": "sha1-8aVAK6YiCtUswSgrrBrjqkn9Bho=",
+"requires": {
+"glob": "^7.1.3"
+}
+},
+"typescript": {
+"version": "4.4.4",
+"resolved": "https://registry.npmjs.org/typescript/-/typescript-4.4.4.tgz",
+"integrity": "sha512-DqGhF5IKoBl8WNf8C1gu8q0xZSInh9j1kJJMqT3a94w1JzVaBU4EXOSMrz9yDqMT0xt3selp83fuFMQ0uzv6qA==",
+"dev": true
+},
+"which": {
+"version": "1.3.1",
+"resolved": "https://registry.npm.taobao.org/which/download/which-1.3.1.tgz?cache=0&sync_timestamp=1574116720213&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fwhich%2Fdownload%2Fwhich-1.3.1.tgz",
+"integrity": "sha1-pFBD1U9YBTFtqNYvn1CRjT2nCwo=",
+"requires": {
+"isexe": "^2.0.0"
+}
+},
+"wrappy": {
+"version": "1.0.2",
+"resolved": "https://registry.npm.taobao.org/wrappy/download/wrappy-1.0.2.tgz",
+"integrity": "sha1-tSQ9jz7BqjXxNkYFvA0QNuMKtp8="
+}
+}
+}
+
+{
+"name": "bilibilivideodownload",
+"version": "1.0.0",
+"description": "",
+"main": "bilibili.js",
+"scripts": {
+"dev": "tsc",
+"test": "echo \"Error: no test specified\" && exit 1"
+},
+"repository": {
+"type": "git",
+"url": "git+https://github.com/MunMunMiao/BilibiliVideoDownload.git"
+},
+"author": "",
+"license": "ISC",
+"bugs": {
+"url": "https://github.com/MunMunMiao/BilibiliVideoDownload/issues"
+},
+"homepage": "https://github.com/MunMunMiao/BilibiliVideoDownload#readme",
+"dependencies": {
+"axios": "^0.24.0",
+"commander": "^8.3.0",
+"fluent-ffmpeg": "^2.1.2",
+"progress": "^2.0.3",
+"rimraf": "^3.0.2"
+},
+"devDependencies": {
+"@types/fluent-ffmpeg": "^2.1.18",
+"@types/node": "^16.11.6",
+"@types/progress": "^2.0.5",
+"@types/rimraf": "^3.0.2",
+"typescript": "^4.4.4"
+}
+}
+当前节点：JSON.main
+
+{
+"compileOnSave": true,
+"compilerOptions": {
+"target": "es2020",
+"module": "commonjs",
+"watch": true,
+"sourceMap": true,
+"rootDir": "./",
+"strict": true,
+"moduleResolution": "node",
+"typeRoots": [
+"node_modules/@types"
+],
+"allowSyntheticDefaultImports": true,
+"esModuleInterop": true,
+"sourceRoot": "./",
+"forceConsistentCasingInFileNames": true,
+"skipLibCheck": true
+},
+"files": [
+"bilibili.ts"
+],
+"exclude": [
+"node_modules"
+]
+}
+当前节点：JSON.compilerOptions.module
+
+{
+"name": "bilibilivideodownload",
+"version": "1.0.0",
+"lockfileVersion": 2,
+"requires": true,
+"packages": {
+"": {
+"name": "bilibilivideodownload",
+"version": "1.0.0",
+"license": "ISC",
+"dependencies": {
+"axios": "^0.24.0",
+"commander": "^8.3.0",
+"fluent-ffmpeg": "^2.1.2",
+"progress": "^2.0.3",
+"rimraf": "^3.0.2"
+},
+"devDependencies": {
+"@types/fluent-ffmpeg": "^2.1.18",
+"@types/node": "^16.11.6",
+"@types/progress": "^2.0.5",
+"@types/rimraf": "^3.0.2",
+"typescript": "^4.4.4"
+}
+},
+"node_modules/@types/events": {
+"version": "3.0.0",
+"resolved": "https://registry.npm.taobao.org/@types/events/download/@types/events-3.0.0.tgz?cache=0&sync_timestamp=1588200013267&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fevents%2Fdownload%2F%40types%2Fevents-3.0.0.tgz",
+"integrity": "sha1-KGLz9Yqaf3w+eNefEw3U1xwlwqc=",
+"dev": true
+},
+"node_modules/@types/fluent-ffmpeg": {
+"version": "2.1.18",
+"resolved": "https://registry.npmjs.org/@types/fluent-ffmpeg/-/fluent-ffmpeg-2.1.18.tgz",
+"integrity": "sha512-LTteOx3RUmnPlKkvhvW9aGOHdJYyEtIiRBVbYVO/zPU65ZYQelbPJ+zBBT+IXup7doMvxVstX7NMoUTWKZOhww==",
+"dev": true,
+"dependencies": {
+"@types/node": "*"
+}
+},
+"node_modules/@types/glob": {
+"version": "7.1.1",
+"resolved": "https://registry.npm.taobao.org/@types/glob/download/@types/glob-7.1.1.tgz?cache=0&sync_timestamp=1588200288112&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fglob%2Fdownload%2F%40types%2Fglob-7.1.1.tgz",
+"integrity": "sha1-qlmhxuP7xCHgfM0xqUTDDrpSFXU=",
+"dev": true,
+"dependencies": {
+"@types/events": "*",
+"@types/minimatch": "*",
+"@types/node": "*"
+}
+},
+"node_modules/@types/minimatch": {
+"version": "3.0.3",
+"resolved": "https://registry.npm.taobao.org/@types/minimatch/download/@types/minimatch-3.0.3.tgz",
+"integrity": "sha1-PcoOPzOyAPx9ETnAzZbBJoyt/Z0=",
+"dev": true
+},
+"node_modules/@types/node": {
+"version": "16.11.6",
+"resolved": "https://registry.npmjs.org/@types/node/-/node-16.11.6.tgz",
+"integrity": "sha512-ua7PgUoeQFjmWPcoo9khiPum3Pd60k4/2ZGXt18sm2Slk0W0xZTqt5Y0Ny1NyBiN1EVQ/+FaF9NcY4Qe6rwk5w==",
+"dev": true
+},
+"node_modules/@types/progress": {
+"version": "2.0.5",
+"resolved": "https://registry.npmjs.org/@types/progress/-/progress-2.0.5.tgz",
+"integrity": "sha512-ZYYVc/kSMkhH9W/4dNK/sLNra3cnkfT2nJyOAIDY+C2u6w72wa0s1aXAezVtbTsnN8HID1uhXCrLwDE2ZXpplg==",
+"dev": true,
+"dependencies": {
+"@types/node": "*"
+}
+},
+"node_modules/@types/rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npmjs.org/@types/rimraf/-/rimraf-3.0.2.tgz",
+"integrity": "sha512-F3OznnSLAUxFrCEu/L5PY8+ny8DtcFRjx7fZZ9bycvXRi3KPTRS9HOitGZwvPg0juRhXFWIeKX58cnX5YqLohQ==",
+"dev": true,
+"dependencies": {
+"@types/glob": "*",
+"@types/node": "*"
+}
+},
+"node_modules/async": {
+"version": "3.2.0",
+"resolved": "https://registry.npm.taobao.org/async/download/async-3.2.0.tgz",
+"integrity": "sha1-s6JoXF67ZB094C0WEALGD8n4VyA="
+},
+"node_modules/axios": {
+"version": "0.24.0",
+"resolved": "https://registry.npmjs.org/axios/-/axios-0.24.0.tgz",
+"integrity": "sha512-Q6cWsys88HoPgAaFAVUb0WpPk0O8iTeisR9IMqy9G8AbO4NlpVknrnQS03zzF9PGAWgO3cgletO3VjV/P7VztA==",
+"dependencies": {
+"follow-redirects": "^1.14.4"
+}
+},
+"node_modules/balanced-match": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/balanced-match/download/balanced-match-1.0.0.tgz",
+"integrity": "sha1-ibTRmasr7kneFk6gK4nORi1xt2c="
+},
+"node_modules/brace-expansion": {
+"version": "1.1.11",
+"resolved": "https://registry.npm.taobao.org/brace-expansion/download/brace-expansion-1.1.11.tgz",
+"integrity": "sha1-PH/L9SnYcibz0vUrlm/1Jx60Qd0=",
+"dependencies": {
+"balanced-match": "^1.0.0",
+"concat-map": "0.0.1"
+}
+},
+"node_modules/commander": {
+"version": "8.3.0",
+"resolved": "https://registry.npmjs.org/commander/-/commander-8.3.0.tgz",
+"integrity": "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww==",
+"engines": {
+"node": ">= 12"
+}
+},
+"node_modules/concat-map": {
+"version": "0.0.1",
+"resolved": "https://registry.npm.taobao.org/concat-map/download/concat-map-0.0.1.tgz",
+"integrity": "sha1-2Klr13/Wjfd5OnMDajug1UBdR3s="
+},
+"node_modules/fluent-ffmpeg": {
+"version": "2.1.2",
+"resolved": "https://registry.npm.taobao.org/fluent-ffmpeg/download/fluent-ffmpeg-2.1.2.tgz",
+"integrity": "sha1-yVLeIkD4EuvaCqgAbXd27irPfXQ=",
+"dependencies": {
+"async": ">=0.2.9",
+"which": "^1.1.1"
+},
+"engines": {
+"node": ">=0.8.0"
+}
+},
+"node_modules/follow-redirects": {
+"version": "1.14.4",
+"resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.14.4.tgz",
+"integrity": "sha512-zwGkiSXC1MUJG/qmeIFH2HBJx9u0V46QGUe3YR1fXG8bXQxq7fLj0RjLZQ5nubr9qNJUZrH+xUcwXEoXNpfS+g==",
+"funding": [
+{
+"type": "individual",
+"url": "https://github.com/sponsors/RubenVerborgh"
+}
+],
+"engines": {
+"node": ">=4.0"
+},
+"peerDependenciesMeta": {
+"debug": {
+"optional": true
+}
+}
+},
+"node_modules/fs.realpath": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/fs.realpath/download/fs.realpath-1.0.0.tgz",
+"integrity": "sha1-FQStJSMVjKpA20onh8sBQRmU6k8="
+},
+"node_modules/glob": {
+"version": "7.1.6",
+"resolved": "https://registry.npm.taobao.org/glob/download/glob-7.1.6.tgz?cache=0&sync_timestamp=1573078121947&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fglob%2Fdownload%2Fglob-7.1.6.tgz",
+"integrity": "sha1-FB8zuBp8JJLhJVlDB0gMRmeSeKY=",
+"dependencies": {
+"fs.realpath": "^1.0.0",
+"inflight": "^1.0.4",
+"inherits": "2",
+"minimatch": "^3.0.4",
+"once": "^1.3.0",
+"path-is-absolute": "^1.0.0"
+},
+"engines": {
+"node": "*"
+},
+"funding": {
+"url": "https://github.com/sponsors/isaacs"
+}
+},
+"node_modules/inflight": {
+"version": "1.0.6",
+"resolved": "https://registry.npm.taobao.org/inflight/download/inflight-1.0.6.tgz",
+"integrity": "sha1-Sb1jMdfQLQwJvJEKEHW6gWW1bfk=",
+"dependencies": {
+"once": "^1.3.0",
+"wrappy": "1"
+}
+},
+"node_modules/inherits": {
+"version": "2.0.4",
+"resolved": "https://registry.npm.taobao.org/inherits/download/inherits-2.0.4.tgz",
+"integrity": "sha1-D6LGT5MpF8NDOg3tVTY6rjdBa3w="
+},
+"node_modules/isexe": {
+"version": "2.0.0",
+"resolved": "https://registry.npm.taobao.org/isexe/download/isexe-2.0.0.tgz",
+"integrity": "sha1-6PvzdNxVb/iUehDcsFctYz8s+hA="
+},
+"node_modules/minimatch": {
+"version": "3.0.4",
+"resolved": "https://registry.npm.taobao.org/minimatch/download/minimatch-3.0.4.tgz",
+"integrity": "sha1-UWbihkV/AzBgZL5Ul+jbsMPTIIM=",
+"dependencies": {
+"brace-expansion": "^1.1.7"
+},
+"engines": {
+"node": "*"
+}
+},
+"node_modules/once": {
+"version": "1.4.0",
+"resolved": "https://registry.npm.taobao.org/once/download/once-1.4.0.tgz",
+"integrity": "sha1-WDsap3WWHUsROsF9nFC6753Xa9E=",
+"dependencies": {
+"wrappy": "1"
+}
+},
+"node_modules/path-is-absolute": {
+"version": "1.0.1",
+"resolved": "https://registry.npm.taobao.org/path-is-absolute/download/path-is-absolute-1.0.1.tgz",
+"integrity": "sha1-F0uSaHNVNP+8es5r9TpanhtcX18=",
+"engines": {
+"node": ">=0.10.0"
+}
+},
+"node_modules/progress": {
+"version": "2.0.3",
+"resolved": "http://registry.npm.taobao.org/progress/download/progress-2.0.3.tgz",
+"integrity": "sha1-foz42PW48jnBvGi+tOt4Vn1XLvg=",
+"engines": {
+"node": ">=0.4.0"
+}
+},
+"node_modules/rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npm.taobao.org/rimraf/download/rimraf-3.0.2.tgz",
+"integrity": "sha1-8aVAK6YiCtUswSgrrBrjqkn9Bho=",
+"dependencies": {
+"glob": "^7.1.3"
+},
+"bin": {
+"rimraf": "bin.js"
+},
+"funding": {
+"url": "https://github.com/sponsors/isaacs"
+}
+},
+"node_modules/typescript": {
+"version": "4.4.4",
+"resolved": "https://registry.npmjs.org/typescript/-/typescript-4.4.4.tgz",
+"integrity": "sha512-DqGhF5IKoBl8WNf8C1gu8q0xZSInh9j1kJJMqT3a94w1JzVaBU4EXOSMrz9yDqMT0xt3selp83fuFMQ0uzv6qA==",
+"dev": true,
+"bin": {
+"tsc": "bin/tsc",
+"tsserver": "bin/tsserver"
+},
+"engines": {
+"node": ">=4.2.0"
+}
+},
+"node_modules/which": {
+"version": "1.3.1",
+"resolved": "https://registry.npm.taobao.org/which/download/which-1.3.1.tgz?cache=0&sync_timestamp=1574116720213&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fwhich%2Fdownload%2Fwhich-1.3.1.tgz",
+"integrity": "sha1-pFBD1U9YBTFtqNYvn1CRjT2nCwo=",
+"dependencies": {
+"isexe": "^2.0.0"
+},
+"bin": {
+"which": "bin/which"
+}
+},
+"node_modules/wrappy": {
+"version": "1.0.2",
+"resolved": "https://registry.npm.taobao.org/wrappy/download/wrappy-1.0.2.tgz",
+"integrity": "sha1-tSQ9jz7BqjXxNkYFvA0QNuMKtp8="
+}
+},
+"dependencies": {
+"@types/events": {
+"version": "3.0.0",
+"resolved": "https://registry.npm.taobao.org/@types/events/download/@types/events-3.0.0.tgz?cache=0&sync_timestamp=1588200013267&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fevents%2Fdownload%2F%40types%2Fevents-3.0.0.tgz",
+"integrity": "sha1-KGLz9Yqaf3w+eNefEw3U1xwlwqc=",
+"dev": true
+},
+"@types/fluent-ffmpeg": {
+"version": "2.1.18",
+"resolved": "https://registry.npmjs.org/@types/fluent-ffmpeg/-/fluent-ffmpeg-2.1.18.tgz",
+"integrity": "sha512-LTteOx3RUmnPlKkvhvW9aGOHdJYyEtIiRBVbYVO/zPU65ZYQelbPJ+zBBT+IXup7doMvxVstX7NMoUTWKZOhww==",
+"dev": true,
+"requires": {
+"@types/node": "*"
+}
+},
+"@types/glob": {
+"version": "7.1.1",
+"resolved": "https://registry.npm.taobao.org/@types/glob/download/@types/glob-7.1.1.tgz?cache=0&sync_timestamp=1588200288112&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2F%40types%2Fglob%2Fdownload%2F%40types%2Fglob-7.1.1.tgz",
+"integrity": "sha1-qlmhxuP7xCHgfM0xqUTDDrpSFXU=",
+"dev": true,
+"requires": {
+"@types/events": "*",
+"@types/minimatch": "*",
+"@types/node": "*"
+}
+},
+"@types/minimatch": {
+"version": "3.0.3",
+"resolved": "https://registry.npm.taobao.org/@types/minimatch/download/@types/minimatch-3.0.3.tgz",
+"integrity": "sha1-PcoOPzOyAPx9ETnAzZbBJoyt/Z0=",
+"dev": true
+},
+"@types/node": {
+"version": "16.11.6",
+"resolved": "https://registry.npmjs.org/@types/node/-/node-16.11.6.tgz",
+"integrity": "sha512-ua7PgUoeQFjmWPcoo9khiPum3Pd60k4/2ZGXt18sm2Slk0W0xZTqt5Y0Ny1NyBiN1EVQ/+FaF9NcY4Qe6rwk5w==",
+"dev": true
+},
+"@types/progress": {
+"version": "2.0.5",
+"resolved": "https://registry.npmjs.org/@types/progress/-/progress-2.0.5.tgz",
+"integrity": "sha512-ZYYVc/kSMkhH9W/4dNK/sLNra3cnkfT2nJyOAIDY+C2u6w72wa0s1aXAezVtbTsnN8HID1uhXCrLwDE2ZXpplg==",
+"dev": true,
+"requires": {
+"@types/node": "*"
+}
+},
+"@types/rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npmjs.org/@types/rimraf/-/rimraf-3.0.2.tgz",
+"integrity": "sha512-F3OznnSLAUxFrCEu/L5PY8+ny8DtcFRjx7fZZ9bycvXRi3KPTRS9HOitGZwvPg0juRhXFWIeKX58cnX5YqLohQ==",
+"dev": true,
+"requires": {
+"@types/glob": "*",
+"@types/node": "*"
+}
+},
+"async": {
+"version": "3.2.0",
+"resolved": "https://registry.npm.taobao.org/async/download/async-3.2.0.tgz",
+"integrity": "sha1-s6JoXF67ZB094C0WEALGD8n4VyA="
+},
+"axios": {
+"version": "0.24.0",
+"resolved": "https://registry.npmjs.org/axios/-/axios-0.24.0.tgz",
+"integrity": "sha512-Q6cWsys88HoPgAaFAVUb0WpPk0O8iTeisR9IMqy9G8AbO4NlpVknrnQS03zzF9PGAWgO3cgletO3VjV/P7VztA==",
+"requires": {
+"follow-redirects": "^1.14.4"
+}
+},
+"balanced-match": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/balanced-match/download/balanced-match-1.0.0.tgz",
+"integrity": "sha1-ibTRmasr7kneFk6gK4nORi1xt2c="
+},
+"brace-expansion": {
+"version": "1.1.11",
+"resolved": "https://registry.npm.taobao.org/brace-expansion/download/brace-expansion-1.1.11.tgz",
+"integrity": "sha1-PH/L9SnYcibz0vUrlm/1Jx60Qd0=",
+"requires": {
+"balanced-match": "^1.0.0",
+"concat-map": "0.0.1"
+}
+},
+"commander": {
+"version": "8.3.0",
+"resolved": "https://registry.npmjs.org/commander/-/commander-8.3.0.tgz",
+"integrity": "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww=="
+},
+"concat-map": {
+"version": "0.0.1",
+"resolved": "https://registry.npm.taobao.org/concat-map/download/concat-map-0.0.1.tgz",
+"integrity": "sha1-2Klr13/Wjfd5OnMDajug1UBdR3s="
+},
+"fluent-ffmpeg": {
+"version": "2.1.2",
+"resolved": "https://registry.npm.taobao.org/fluent-ffmpeg/download/fluent-ffmpeg-2.1.2.tgz",
+"integrity": "sha1-yVLeIkD4EuvaCqgAbXd27irPfXQ=",
+"requires": {
+"async": ">=0.2.9",
+"which": "^1.1.1"
+}
+},
+"follow-redirects": {
+"version": "1.14.4",
+"resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.14.4.tgz",
+"integrity": "sha512-zwGkiSXC1MUJG/qmeIFH2HBJx9u0V46QGUe3YR1fXG8bXQxq7fLj0RjLZQ5nubr9qNJUZrH+xUcwXEoXNpfS+g=="
+},
+"fs.realpath": {
+"version": "1.0.0",
+"resolved": "https://registry.npm.taobao.org/fs.realpath/download/fs.realpath-1.0.0.tgz",
+"integrity": "sha1-FQStJSMVjKpA20onh8sBQRmU6k8="
+},
+"glob": {
+"version": "7.1.6",
+"resolved": "https://registry.npm.taobao.org/glob/download/glob-7.1.6.tgz?cache=0&sync_timestamp=1573078121947&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fglob%2Fdownload%2Fglob-7.1.6.tgz",
+"integrity": "sha1-FB8zuBp8JJLhJVlDB0gMRmeSeKY=",
+"requires": {
+"fs.realpath": "^1.0.0",
+"inflight": "^1.0.4",
+"inherits": "2",
+"minimatch": "^3.0.4",
+"once": "^1.3.0",
+"path-is-absolute": "^1.0.0"
+}
+},
+"inflight": {
+"version": "1.0.6",
+"resolved": "https://registry.npm.taobao.org/inflight/download/inflight-1.0.6.tgz",
+"integrity": "sha1-Sb1jMdfQLQwJvJEKEHW6gWW1bfk=",
+"requires": {
+"once": "^1.3.0",
+"wrappy": "1"
+}
+},
+"inherits": {
+"version": "2.0.4",
+"resolved": "https://registry.npm.taobao.org/inherits/download/inherits-2.0.4.tgz",
+"integrity": "sha1-D6LGT5MpF8NDOg3tVTY6rjdBa3w="
+},
+"isexe": {
+"version": "2.0.0",
+"resolved": "https://registry.npm.taobao.org/isexe/download/isexe-2.0.0.tgz",
+"integrity": "sha1-6PvzdNxVb/iUehDcsFctYz8s+hA="
+},
+"minimatch": {
+"version": "3.0.4",
+"resolved": "https://registry.npm.taobao.org/minimatch/download/minimatch-3.0.4.tgz",
+"integrity": "sha1-UWbihkV/AzBgZL5Ul+jbsMPTIIM=",
+"requires": {
+"brace-expansion": "^1.1.7"
+}
+},
+"once": {
+"version": "1.4.0",
+"resolved": "https://registry.npm.taobao.org/once/download/once-1.4.0.tgz",
+"integrity": "sha1-WDsap3WWHUsROsF9nFC6753Xa9E=",
+"requires": {
+"wrappy": "1"
+}
+},
+"path-is-absolute": {
+"version": "1.0.1",
+"resolved": "https://registry.npm.taobao.org/path-is-absolute/download/path-is-absolute-1.0.1.tgz",
+"integrity": "sha1-F0uSaHNVNP+8es5r9TpanhtcX18="
+},
+"progress": {
+"version": "2.0.3",
+"resolved": "http://registry.npm.taobao.org/progress/download/progress-2.0.3.tgz",
+"integrity": "sha1-foz42PW48jnBvGi+tOt4Vn1XLvg="
+},
+"rimraf": {
+"version": "3.0.2",
+"resolved": "https://registry.npm.taobao.org/rimraf/download/rimraf-3.0.2.tgz",
+"integrity": "sha1-8aVAK6YiCtUswSgrrBrjqkn9Bho=",
+"requires": {
+"glob": "^7.1.3"
+}
+},
+"typescript": {
+"version": "4.4.4",
+"resolved": "https://registry.npmjs.org/typescript/-/typescript-4.4.4.tgz",
+"integrity": "sha512-DqGhF5IKoBl8WNf8C1gu8q0xZSInh9j1kJJMqT3a94w1JzVaBU4EXOSMrz9yDqMT0xt3selp83fuFMQ0uzv6qA==",
+"dev": true
+},
+"which": {
+"version": "1.3.1",
+"resolved": "https://registry.npm.taobao.org/which/download/which-1.3.1.tgz?cache=0&sync_timestamp=1574116720213&other_urls=https%3A%2F%2Fregistry.npm.taobao.org%2Fwhich%2Fdownload%2Fwhich-1.3.1.tgz",
+"integrity": "sha1-pFBD1U9YBTFtqNYvn1CRjT2nCwo=",
+"requires": {
+"isexe": "^2.0.0"
+}
+},
+"wrappy": {
+"version": "1.0.2",
+"resolved": "https://registry.npm.taobao.org/wrappy/download/wrappy-1.0.2.tgz",
+"integrity": "sha1-tSQ9jz7BqjXxNkYFvA0QNuMKtp8="
+}
+}
+}
+
+import { mkdirSync, createWriteStream } from 'fs'
+import { join, resolve } from 'path'
+import axios from 'axios'
+import { program } from 'commander'
+import progress from 'progress'
+import ffmpeg from 'fluent-ffmpeg'
+import rimraf from 'rimraf'
+
+program.requiredOption('-b, --bv <string>', 'BV id')
+program.requiredOption('-c, --cookie <number>', 'SESSDATA')
+program.requiredOption('-d, --directory <string>', 'Output directory', './output')
+
+program.parse(process.argv)
+
+const userAgent: string = `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.122 Safari/537.36`
+let directory: string = './output'
+let BVID: string | undefined
+let SESSDATA: string | undefined
+let videoData: VideoData | undefined
+
+const values = program.opts<{
+    bv?: string
+    cookie?: string
+    directory?: string
+}>()
+
+if (values.bv){
+    BVID = values.bv
+}
+if (values.cookie){
+    SESSDATA = decodeURI(values.cookie)
+}
+if (values.directory){
+    directory = join(values.directory)
+}
+
+console.log('Input config:')
+console.table({
+    BV: BVID,
+    SESSDATA: SESSDATA,
+    Directory: directory ? resolve(directory) : ''
+})
+
+interface BaseResponse<T =any> {
+    code: number
+    message: number
+    ttl: number
+    data: T
+}
+
+interface UserData {
+    isLogin: boolean
+    email_verified: number
+    face: string
+    level_info: {
+        current_level: number
+        current_min: number
+        current_exp: number
+        next_exp: number
+    },
+    mid: number
+    mobile_verified: number
+    money: number
+    moral: number
+    official: {
+        role: number
+        title: string
+        desc: string
+        type: number
+    },
+    officialVerify: {
+        type: number
+        desc: string
+    },
+    pendant: {
+        pid: number
+        name: string
+        image: string
+        expire: number
+        image_enhance: string
+    },
+    scores: number
+    uname: string
+    vipDueDate: number
+    vipStatus: number
+    vipType: number
+    vip_pay_type: number
+    vip_theme_type: number
+    wallet: {
+        mid: number
+        bcoin_balance: number
+        coupon_balance: number
+        coupon_due_time: number
+    },
+    "has_shop": boolean,
+    "shop_url": string
+    "allowance_count": number
+    "answer_status": number
+}
+
+async function getCurrentUserData(): Promise<void>{
+    const result = await axios.get<BaseResponse<UserData>>('https://api.bilibili.com/nav', {
+        headers: {
+            Cookie: `SESSDATA=${ SESSDATA || '' }`,
+            'User-Agent': userAgent
+        }
+    })
+
+    if (result.data.code === 0){
+        console.log('Current user:')
+        console.table({
+            id: result.data.data.mid,
+            name: result.data.data.uname,
+            isVip: result.data.data.vipStatus === 1
+        })
+    }else {
+        throw new Error(`Error getting user information`)
+    }
+}
+
+interface PartItem {
+    cid: number
+    page: number
+    from: string
+    part: string
+    duration: number
+    vid: string
+    weblink: string
+    dimension: {
+        width: number
+        height: number
+        rotate: number
+    }
+}
+
+interface VideoData {
+    bvid: string
+    aid: number
+    videos: number
+    tid: number
+    tname: string
+    copyright: number
+    pic: string
+    title: string
+    pubdate: number
+    ctime: number
+    desc: string
+    state: number
+    attribute: number
+    duration: number
+    pages: PartItem[]
+}
+
+async function getVideoData(): Promise<VideoData>{
+    const result = await axios.get<BaseResponse<VideoData>>('https://api.bilibili.com/x/web-interface/view', {
+        params: {
+            bvid: BVID
+        },
+        headers: {
+            Cookie: `SESSDATA=${ SESSDATA || '' }`,
+            'User-Agent': userAgent
+        }
+    })
+
+    if (result.data.code === 0){
+        let info: {[key: string]: string} = {
+            BV: result.data.data.bvid,
+            AV: `AV${ result.data.data.aid }`,
+            Title: result.data.data.title,
+            // desc: result.data.data.desc
+        }
+
+        for (const [index, item] of result.data.data.pages.entries()){
+            info[`Part-${ index + 1 }`] = item.part
+        }
+
+        console.log('Video data:')
+        console.table(info)
+        return result.data.data
+    }else {
+        throw new Error(`Error getting video data`)
+    }
+}
+
+interface DashData {
+    duration: number
+    minBufferTime: number
+    min_buffer_time: number
+    video: {
+        id: number
+        baseUrl: string
+        base_url: string
+        backupUrl: string[],
+        backup_url: string[],
+        bandwidth: number
+        mimeType: string
+        mime_type: string
+        codecs: string
+        width: number
+        height: number
+        frameRate: string
+        frame_rate: string
+        sar: string
+        startWithSap: number
+        start_with_sap: number
+        SegmentBase: {
+            Initialization: string
+            indexRange: string
+        },
+        segment_base: {
+            initialization: string
+            index_range: string
+        },
+        codecid: number
+    }[],
+    audio: {
+        id: number
+        baseUrl: string
+        base_url: string
+        backupUrl: string[],
+        backup_url: string[],
+        bandwidth: number
+        mimeType: string
+        mime_type: string
+        codecs: string
+        width: number
+        height: number
+        frameRate: string
+        frame_rate: string
+        sar: string
+        startWithSap: number
+        start_with_sap: number
+        SegmentBase: {
+            Initialization: string
+            indexRange: string
+        },
+        segment_base: {
+            initialization: string
+            index_range: string
+        },
+        codecid: number
+    }[]
+}
+
+interface FlvData {
+    order: number
+    length: number
+    size: number
+    ahead: string
+    vhead: string
+    url: string
+    backup_url: string[]
+}
+
+class BaseStream{
+    constructor(
+        public from: string,
+        public result: string,
+        public message: string,
+        public quality: number,
+        public format: string,
+        public timelength: number,
+        public accept_format: string,
+        public accept_description: string[],
+        public accept_quality: number[],
+        public video_codecid: number,
+        public seek_param: string,
+        public seek_type: string
+    ) {}
+}
+
+class DashStream{
+    get stream() {
+        return {
+            video: this.dash.video.sort((a, b) => b.id - a.id)[0],
+            audio: this.dash.audio.sort((a, b) => b.id - a.id)[0]
+        }
+    }
+
+    constructor(
+        public from: string,
+        public result: string,
+        public message: string,
+        public quality: number,
+        public format: string,
+        public timelength: number,
+        public accept_format: string,
+        public accept_description: string[],
+        public accept_quality: number[],
+        public video_codecid: number,
+        public seek_param: string,
+        public seek_type: string,
+        public dash: DashData
+    ) {}
+}
+
+class FlvStream{
+    constructor(
+        public from: string,
+        public result: string,
+        public message: string,
+        public quality: number,
+        public format: string,
+        public timelength: number,
+        public accept_format: string,
+        public accept_description: string[],
+        public accept_quality: number[],
+        public video_codecid: number,
+        public seek_param: string,
+        public seek_type: string,
+        public durl: FlvData[]
+    ) {}
+}
+
+async function getAcceptQuality(cid: number): Promise<number[]>{
+    const result = await axios.get<BaseResponse<BaseStream>>('https://api.bilibili.com/x/player/playurl', {
+        params: {
+            bvid: BVID,
+            cid,
+            fourk: 1,
+            fnval: 80
+        },
+        headers: {
+            Cookie: `SESSDATA=${ SESSDATA || '' }`,
+            'User-Agent': userAgent
+        }
+    })
+
+    if (result.data.code === 0){
+        return result.data.data.accept_quality.sort((a, b) => b - a)
+    }else {
+        throw new Error(`Failed to obtain video information`)
+    }
+}
+
+async function getVideoUrl(cid: number, qualityId: number): Promise<DashStream | FlvStream>{
+    const result = await axios.get<BaseResponse>('https://api.bilibili.com/x/player/playurl', {
+        params: {
+            bvid: BVID,
+            cid,
+            fnval: 80,
+            qn: qualityId,
+            fourk: 1
+        },
+        headers: {
+            Cookie: `SESSDATA=${ SESSDATA || '' }`,
+            'User-Agent': userAgent
+        }
+    })
+
+    if (result.data.code === 0){
+        const _data = result.data.data
+        const acceptFormat: string[] = _data.accept_format.split(',')
+        if ((acceptFormat.includes('mp4') || acceptFormat.includes('hdflv2')) || Object.keys(_data).includes('dash')){
+            return new DashStream(
+                _data.from,
+                _data.result,
+                _data.message,
+                _data.quality,
+                _data.format,
+                _data.timelength,
+                _data.accept_format,
+                _data.accept_description,
+                _data.accept_quality,
+                _data.video_codecid,
+                _data.seek_param,
+                _data.seek_type,
+                _data.dash
+            )
+        }else {
+            return new FlvStream(
+                _data.from,
+                _data.result,
+                _data.message,
+                _data.quality,
+                _data.format,
+                _data.timelength,
+                _data.accept_format,
+                _data.accept_description,
+                _data.accept_quality,
+                _data.video_codecid,
+                _data.seek_param,
+                _data.seek_type,
+                _data.durl
+            )
+        }
+    }else {
+        throw new Error(`Error getting video download link`)
+    }
+}
+
+async function download(part: PartItem, url: string, type?: string): Promise<string>{
+    const response = await axios.get(url, {
+        responseType: 'stream',
+        headers: {
+            'User-Agent': userAgent,
+            'Referer': `https://www.bilibili.com/video/${ BVID }`
+        }
+    })
+    let downloaded: number = 0
+    const contentType: string = type || String(response.headers['content-type'])
+    const total: number = Number(response.headers['content-length'])
+    const filePath: string = join(__dirname, '/tmp', `${ part.cid }-${ total }`)
+    const bar = new progress(`${ contentType } [:bar] :percent :downloaded/:length`, {
+        width: 30,
+        total: total
+    })
+    response.data.pipe(createWriteStream(filePath))
+
+    return new Promise<string>((resolve, reject) => {
+        response.data.on('data', (chunk: Buffer) => {
+            downloaded += chunk.length
+            bar.tick(chunk.length, {
+                downloaded: transform(downloaded),
+                length: transform(total)
+            })
+        })
+        response.data.on('end', () => resolve(filePath))
+        response.data.on('error', (err: any) => reject(err))
+    })
+}
+
+function convert(fileName: string, part: PartItem, paths: string[]): Promise<void>{
+    return new Promise((resolve, reject) => {
+        if (paths.length <= 0){
+            return
+        }
+
+        mkdirSync(join(directory), { recursive: true })
+        const command = ffmpeg()
+
+        for (const item of paths){
+            command.mergeAdd(item)
+        }
+
+        command.videoCodec(`copy`)
+        command.audioCodec(`copy`)
+        command.output(join(directory, `${ fileName }_${ BVID }_${ part.part }.mkv`))
+
+        command.on('start', () => {
+            console.log(`Convert start`)
+        })
+        command.on('error', err => {
+            for (const item of paths){
+                rimraf.sync(item)
+            }
+            reject(err)
+        })
+        command.on('end', () => {
+            for (const item of paths){
+                rimraf.sync(item)
+            }
+            console.log(`Convert complete`)
+            resolve()
+        })
+
+        command.run()
+    })
+}
+
+function transform(value?: number): string{
+    if (!value || value <= 0){
+        return '0 bytes'
+    }
+
+    const s = ['bytes', 'KB', 'MB', 'GB', 'TB', 'PB']
+    const e = Math.floor(Math.log(value) / Math.log(1024))
+    return `${ (value / Math.pow(1024, Math.floor(e))).toFixed(2) }${ s[e] }`
+}
+
+function normalizeName(str: string): string{
+    str = str.replace(/(\?|\*)/g, '')
+    str = str.replace(/(\/|\|)/g, ' ')
+    str = str.replace(/:/g, '-')
+    str = str.replace(/"/g, '\`')
+    str = str.replace(/</g, '(')
+    str = str.replace(/>/g, ')')
+    return str
+}
+
+async function main(): Promise<void>{
+    if (!BVID){
+        return
+    }
+
+    mkdirSync(join(__dirname, '/tmp'), { recursive: true })
+
+    await getCurrentUserData()
+    videoData = await getVideoData()
+
+    for (const item of videoData.pages){
+        const qualityArray = await getAcceptQuality(item.cid)
+        const stream = await getVideoUrl(item.cid, qualityArray[0])
+        const paths = []
+
+        console.log(`Part: ${ item.page }`)
+        console.log(`Name: ${ item.part }`)
+        if (stream instanceof DashStream){
+            const videoPath = await download(item, stream.stream.video.baseUrl, stream.dash.video[0].mimeType)
+            const audioPath = await download(item, stream.stream.audio.baseUrl, stream.dash.audio[0].mimeType)
+            paths.push(videoPath)
+            paths.push(audioPath)
+        }
+
+        if (stream instanceof FlvStream){
+            const filePath = await download(item, stream.durl[0].url)
+            paths.push(filePath)
+        }
+
+        await convert(normalizeName(videoData.title), item, paths)
+    }
+
+    rimraf.sync(join(__dirname, '/tmp'))
+    console.log(`Task complete`)
+}
+
+main()
+
+root = true
+
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+insert_final_newline = true
+
+[*.md]
+max_line_length = off
+
